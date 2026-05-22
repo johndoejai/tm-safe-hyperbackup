@@ -363,7 +363,82 @@ Anmerkung: Nimm das aus meinem Skript aus der inbox. Das funktioniert bisher.
   Nutzer-Anmerkung; funktioniert im inbox-Skript bereits).
 - DRY_RUN-Schalter als Variable oben im Skript.
 
+## Nachtrag 3 (21. Mai 2026): Stuck-Lease-Befund kippt die Strategie
+Nach drei Beobachtungsnaechten via Live-Monitor wird klar, dass die ursprueng-
+liche Strategie B in der strikten Form (Timeout = Abbruch) nicht haltbar ist.
+
+### Drei Naechte, drei sehr unterschiedliche Bilder
+- **Nacht 1** (Skript-Test mit 8h-Timeout): das Skript sah ueber 8 Stunden
+  durchgehend "offen" — kein einziger Moment ohne `bands/<id>`-Locks. Exit 10.
+- **Nacht 2** (Monitor v1): host_a wechselte regelmaessig zwischen ACTIVE/IDLE/
+  OFFLINE; etwa 50% der Zeit OFFLINE, viele Idle-Phasen >20 min.
+- **Nacht 3** (Monitor v2 mit Hash-Spalte): host_a 85% "active" laut alter
+  Heuristik. Aber bei Hash-Vergleich der Lock-Liste zwischen zwei aufeinander-
+  folgenden Samples zeigt sich: **42% sind STUCK** (gleiche Lock-Liste ueber
+  Minuten), **nur 4.9% wirklich frisch** (Hash wechselt zwischen Samples).
+
+### Mechanik: macOS-OpLock-Lease-Cache
+macOS SMB-Client haelt `LEASE(RWH)`-OpLocks im Cache, auch nachdem Backup-
+Phasen geendet haben — vermutlich um spaetere Re-Zugriffe zu beschleunigen.
+Der Synology-Server zeigt diese Locks weiterhin als "gehalten", obwohl der
+Mac nichts mehr schreibt. Verifiziert durch:
+- Nacht 3, ab 05:09: host_a `total=130 active=128 hash=X` blieb **5 Stunden
+  lang Pixel-fuer-Pixel identisch**. host_b im selben Zeitraum: normale
+  ACTIVE/OFFLINE-Wechsel. Klarer Indikator fuer stuck Cache nur bei host_a.
+
+### Spike `smbstatus -p` (21. Mai 2026)
+Geprueft, ob Samba 4.x auf DSM eine native Idle-Time-Information pro
+Session liefert (waere eleganter als Hash-Vergleich). Output:
+```
+PID    Username  Group  Machine  Protocol Version  Encryption  Signing
+26096  TM_host_b  users  ...      SMB3_11           AES-128-GCM AES-128-GMAC
+6499   TM_host_a   users  ...      SMB3_11           AES-128-GCM AES-128-GMAC
+```
+**Keine Idle-Time-Spalte.** Hash-Vergleich bleibt das praktikabelste Mittel.
+
+### Strategische Debatte v2 (Konsens)
+Eine zweite Opus-Debatte (Alpha + Beta) mit den jetzigen Daten und Erkenntnis-
+sen konvergierte auf folgenden Punkten:
+
+1. **Re-Framing**: nicht "Phase A ist Schutzmechanismus", sondern "Btrfs-
+   Snapshot von Hyper Backup ist die Konsistenzgarantie. SMB-Heuristik ist
+   nur ein opportunistischer Versuch, das Snapshot-Fenster in eine ruhige
+   Phase zu legen."
+2. **Hash-Heuristik** als Detection: zwei `smbstatus`-Samples, cksum-Vergleich
+   der Lock-Pfad-Liste. Wenn unveraendert -> "stuck Cache, ok zu triggern".
+3. **Pfad-Extraktion robuster**: `awk '{for(i=1;i<=NF;i++) if($i ~
+   /\.sparsebundle\//) print $i}'` statt fragiles `NF-5` — immun gegen
+   Samba-Spaltendrift.
+4. **Phase-A-Timeout = Fallthrough mit Log-Marker** (`WARN: bypass_after_
+   timeout=1`), kein `exit 10` mehr. Sparsebundle ist gegen Crash-Konsistenz
+   robust (CoW in den Bands + atomare Token-Writes).
+5. **DEBUG=1-Schalter** fuer Anfaenger-Diagnostik (rohe smbstatus-Auszuege).
+6. **Hash-Kommentar im Code explizit**: "Best-Effort-Hoeflichkeit, kein
+   Korruptionsschutz".
+7. **Polling-Intervall 60s**, **Timeout bei 30 min** (Orchestrator-Synthese
+   aus Alpha/Beta-Dissens).
+8. **Mac-seitige Loesungen verworfen** (Power Nap aus, `tmutil stopbackup`,
+   `diskutil unmount`): verletzt KISS, Mac-Configs driften.
+
+## Strategie-Entscheidung (final, 21. Mai 2026)
+**Strategie D' (= Best-Effort-Trigger mit Hash-basierter Idle-Detection und
+Snapshot als Konsistenzgarantie).**
+
+Ablauf:
+1. **Phase 0**: Preflight (unveraendert).
+2. **Phase A**: zwei `smbstatus`-Samples im Abstand von 60s. Wenn die Hash-
+   Werte der Schreib-Lock-Pfade gleich sind ODER 0 Schreib-Locks: triggern.
+   Sonst warten weitere 60s. Max 30 min, dann **Fallthrough** mit WARN-Log.
+3. **Phase B** (DRY_RUN): unveraendert.
+4. **Phase C**: Hyper Backup ausloesen, auf Erfolg/Fehler warten
+   (unveraendert).
+
+Konsistenz-Garantie kommt aus:
+- Btrfs-Snapshot, den Hyper Backup automatisch beim Backup-Start anlegt
+- Sparsebundle-Crash-Toleranz (CoW in Bands, atomare Schreibmuster) — gegen
+  Mid-write-Snapshots seit 2007 designt
+
 ## Naechste Schritte
-- Plan wird in `plan.md` ausgearbeitet (Skriptstruktur, Code-Schnipsel,
-  Todo-Liste, Test-Plan).
-- Annotations-Zyklus auf plan.md vor der Implementierung.
+- `plan.md` wird mit neuer Strategie D' aktualisiert.
+- Skript-Implementierung wird angepasst (Hash-Heuristik, Fallthrough, DEBUG).
+- Tests + Commit.

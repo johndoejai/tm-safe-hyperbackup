@@ -48,13 +48,17 @@ TM_SHARE="TM_host_a"                    # Name der TM-Freigabe (wie in DSM)
 TASK_ID="4"                           # Hyper-Backup-Task-ID (aus synobackup.conf)
 TASK_NAME="SynoC2-TM_host_a"            # Hyper-Backup-Task-Name (zum Log-Filtern)
 DRY_RUN=0                             # 1 = nichts ausloesen, nur protokollieren
+DEBUG=0                               # 1 = rohe smbstatus-Auszuege ins Log (fuer Diagnose ohne Coder-Hilfe)
 # ====== Selten anzupassen ======
-SMB_POLL_INTERVAL=30                  # Sekunden zwischen smbstatus-Checks
-SMB_POLL_TIMEOUT_SEC=1800             # max. Wartezeit auf TM-Ruhe (1800 s = 30 min)
+SMB_POLL_INTERVAL=60                  # Sekunden zwischen den zwei smbstatus-Samples einer is_share_writing-Pruefung
+SMB_POLL_TIMEOUT_SEC=1800             # max. Wartezeit auf TM-Ruhe (1800 s = 30 min); bei Timeout: Fallthrough mit Warn-Log
 HB_POLL_INTERVAL=30                   # Sekunden zwischen HB-Log-Checks
 HB_POLL_TIMEOUT_SEC=21600             # max. Wartezeit auf Backup-Ende (21600 s = 6 h)
-SMBSTATUS_BIN="smbstatus"             # in Login-/Aufgabenplaner-PATH; falls "command not found": "/usr/local/bin/smbstatus"
-SYNOBACKUP_BIN="synobackup"           # in Login-/Aufgabenplaner-PATH; falls "command not found": "/usr/syno/bin/synobackup"
+VOLUME_PATH="/volume2"                # Volume mit TM_SHARE (fuer Btrfs-Check); anpassen falls nicht /volume2
+# Volle Bin-Pfade als Default, PATH-unabhaengig:
+SMBSTATUS_BIN="/usr/local/bin/smbstatus"
+SYNOBACKUP_BIN="/usr/syno/bin/synobackup"
+JQ_BIN="/usr/bin/jq"
 HB_LOG="/var/packages/HyperBackup/var/log/synolog/synobackup.log"
 ```
 
@@ -76,26 +80,73 @@ log() {
 Alle Statusmeldungen gehen ueber `log`. Das macht das Aufgabenplaner-Log
 zeilenweise filterbar (`grep` per Datum/Stichwort).
 
-### 5. Hilfsfunktion: Pruefen, ob die TM-Freigabe gerade offen ist
+### 5. Hilfsfunktion: aktiven Schreibvorgang erkennen
+**Strategiewechsel nach Stuck-Lease-Befund (siehe research.md Nachtrag 3):**
+Statt "irgendein Lock = offen" pruefen wir, ob sich die Lock-Liste zwischen
+zwei Samples **veraendert** hat. macOS haelt OpLock-Leases im Cache, auch
+nach Backup-Ende — eine konstante Lock-Liste heisst also "kein Schreibvorgang
+in den letzten 60 s".
+
 ```sh
-# Liefert Exit 0, wenn mindestens eine SMB-Datei in /<TM_SHARE>/ geoeffnet ist.
-# Liefert Exit 1, wenn keine Lock-Zeile auf den Share matcht.
-# Sucht per fixer Zeichenkette "/<TM_SHARE>/" — der finale Slash verhindert
-# False-Positive auf z. B. "TM_host_a_old".
-is_share_open() {
-    if "$SMBSTATUS_BIN" -L 2>/dev/null | grep -q -F -- "/${TM_SHARE}/"; then
-        return 0
+# Hash der Lock-Pfade fuer einen Share. Bei leerer Eingabe gibt cksum den
+# konstanten Wert 4294967295 zurueck — der wird im Vergleich automatisch zu
+# "ruhig".
+#
+# Robustheit: Wir parsen den offiziellen JSON-Output von smbstatus (--json,
+# Samba 4.12+). Das Schema ist stabil — immun gegen Tabellen-Spaltendrift
+# bei Samba-Updates. jq filtert auf service_path-Endpunkt (= Share) und
+# auf bands/mapped-Subpfade (= Schreib-Locks).
+share_lock_hash() {
+    "$SMBSTATUS_BIN" -L --json 2>/dev/null \
+        | "$JQ_BIN" -r --arg share "$TM_SHARE" '
+            .open_files
+            | to_entries[]
+            | select(.value.service_path | endswith("/" + $share))
+            | select(.value.filename | test("\\.sparsebundle/(bands|mapped)/"))
+            | .key
+          ' \
+        | sort -u \
+        | cksum \
+        | awk '{print $1}'
+}
+
+# Prueft, ob TM gerade aktiv schreibt.
+# Liefert 0 (= "schreibt") wenn sich die Lock-Liste zwischen zwei Samples
+# (60 s Abstand) geaendert hat. Liefert 1 (= "ruhig") sonst.
+#
+# Wichtig: "ruhig" heisst hier "keine neuen/verschwundenen Locks in 60 s" —
+# Stuck-Lease-Cache wird korrekt als "ruhig" erkannt. Wenn ueberhaupt keine
+# Schreib-Locks da sind (Mac OFFLINE oder IDLE), ist der Hash der "leere"
+# 4294967295-Wert und stimmt zwischen beiden Samples eh ueberein.
+is_share_writing() {
+    h1=$(share_lock_hash)
+    sleep "$SMB_POLL_INTERVAL"
+    h2=$(share_lock_hash)
+    if [ "$h1" = "$h2" ]; then
+        return 1   # ruhig
     fi
-    return 1
+    return 0   # aktiv schreibend
 }
 ```
+
+**Wichtig zur Interpretation** (steht auch im Skript-Header explizit drin):
+
+Die Hash-Heuristik ist **Best-Effort-Hoeflichkeit, kein Korruptionsschutz**.
+Die eigentliche Konsistenz-Garantie kommt aus zwei Schichten:
+- **Hyper Backup macht einen Btrfs-Snapshot** vor dem Backup (offiziell
+  dokumentiert; automatisch bei Btrfs-Quellen).
+- **Sparsebundle ist Crash-konsistent** designt (CoW-Bands, atomare Token-
+  Schreibmuster). macOS Time Machine ist gegen Mid-write-Snapshots robust.
+
+Phase A versucht nur, das Snapshot-Fenster opportunistisch in eine ruhige
+Phase zu legen. Beim Timeout wird trotzdem getriggert (siehe Phase A unten).
+
 Erklaerung fuer Anfaenger:
-- `smbstatus -L` listet aktuelle SMB-Datei-Locks. Wenn der Mac das Bundle
-  geoeffnet hat, stehen mehrere Zeilen mit Pfad `/volume2/TM_host_a/…` drin.
-- `grep -F` macht eine **fixe**, schnelle Zeichenkettensuche (kein Regex) —
-  formatunabhaengig gegen Samba-Version-Updates.
-- Der finale `/` im Suchstring (`"/${TM_SHARE}/"`) garantiert, dass nur echte
-  Unterpfade gezaehlt werden, nicht Shares mit aehnlichem Praefix.
+- `smbstatus -L` listet Datei-Locks; wir filtern auf Schreib-Locks im
+  Sparsebundle (`bands/<id>` oder `mapped/<id>`).
+- `cksum` macht aus der sortierten Lock-Liste einen kurzen Zahlen-Fingerabdruck.
+- Zwei Samples mit 60 s Abstand: wenn der Fingerabdruck identisch ist, hat
+  sich nichts geaendert -> nichts wird geschrieben -> ruhig.
 
 ### 6. Hauptablauf: Preflight + Warten + Backup ausloesen + Auf Erfolg warten
 
@@ -128,17 +179,27 @@ Konfig-Werte und Bin-Versionen werden anschliessend einmal ins Log
 geschrieben, damit man im Aufgabenplaner-Log nachvollziehen kann, was
 geprueft wurde.
 
-#### Phase A — Vorpruefung und Wartezeit auf TM-Ruhe
+#### Phase A — opportunistische Suche nach ruhigem Snapshot-Fenster
+**Neue Semantik (siehe research.md Nachtrag 3):** Phase A blockiert das Backup
+**nicht** mehr. Sie versucht, ein ruhiges Fenster zu finden — wenn das in
+30 min nicht klappt, geht das Backup trotzdem durch (Btrfs-Snapshot fangt
+ab). `exit 10` ist damit obsolet und faellt aus der Exit-Code-Tabelle.
+
 1. `log "Start"` plus Konfigwerte ins Log schreiben (zum Nachvollziehen).
 2. **`elapsed=0`** explizit setzen (sonst knallt `set -u` in der Schleife).
-3. Schleife: solange `is_share_open` UND `elapsed < SMB_POLL_TIMEOUT_SEC`:
-   - log: "TM_host_a offen, warte 30 s…"
-   - `sleep "$SMB_POLL_INTERVAL"`
-   - `elapsed=$((elapsed + SMB_POLL_INTERVAL))`
-4. Wenn `is_share_open` Pruefung selbst fehlschlaegt (smbstatus nicht
-   ausfuehrbar trotz Preflight): log Fehler, **exit 2**.
-5. Wenn Schleife endet weil Timeout: log WARNUNG, **exit 10**.
-6. Wenn Schleife endet weil zu: log "TM_host_a geschlossen, starte Backup".
+3. Schleife: solange `is_share_writing` ODER `elapsed < SMB_POLL_TIMEOUT_SEC`:
+   - Pro Iteration ruft `is_share_writing` zwei smbstatus-Samples auf
+     (jeweils 60s Abstand). Iteration dauert also ~60 s Wallclock.
+   - Bei "schreibt": log "TM_host_a schreibt aktiv (verstrichen: ${elapsed}s)"
+   - Bei "ruhig": log "TM_host_a ruhig — bereit fuer Backup", `break`
+   - `elapsed += $SMB_POLL_INTERVAL`
+4. Wenn Schleife endet weil Timeout (`is_share_writing` war bis zum Ende
+   "aktiv"): log
+   `WARNUNG: bypass_after_timeout=1 — TM dauer-aktiv (vermutlich Power Nap
+   oder grosser Backup-Lauf). Triggere trotzdem; HB-Btrfs-Snapshot fangt
+   Crash-Konsistenz ab.`
+   Kein Exit hier — Fallthrough zu Phase B/C.
+5. Wenn Schleife endet weil ruhig: log "TM_host_a ruhig, starte Backup".
 
 #### Phase B — DRY_RUN-Pfad
 7. Wenn `DRY_RUN=1`: log "DRY_RUN — wuerde jetzt `synobackup --backup
@@ -202,11 +263,16 @@ gleichen `START_TS` als Untergrenze.
 |------|-----------|
 | 0    | Erfolg (Backup gelaufen oder DRY_RUN gemacht) |
 | 1    | Konfig-/Voraussetzungs-Fehler (z. B. Variable nicht gesetzt) |
-| 2    | `smbstatus` konnte nicht aufgerufen werden |
-| 10   | TM-Freigabe nach Timeout immer noch offen — kein Backup ausgeloest |
-| 11   | `synobackup`-Aufruf selbst fehlgeschlagen |
+| 11   | `synobackup`-Aufruf selbst fehlgeschlagen oder Started-Marker fehlt |
 | 12   | Backup ausgefuehrt, aber Log zeigt Fehler/Abbruch |
 | 13   | Backup-Ende nicht im Zeitfenster gefunden (HB_POLL_TIMEOUT_SEC) |
+
+**Exit-Code 10 wurde entfernt** (war "TM-Timeout"-Abbruch). Phase-A-Timeout
+fuehrt jetzt zu Fallthrough mit Warn-Log; das Backup wird trotzdem getriggert.
+**Exit-Code 2 wurde entfernt** (war "smbstatus-Fehler"). Im Hash-Heuristik-
+Modus geben smbstatus-Fehler einen leeren Hash zurueck, was als "ruhig"
+interpretiert wird — Backup laeuft trotzdem; alternativ schlaegt schon
+Preflight an `command -v smbstatus` an.
 
 DSM-Aufgabenplaner zeigt den Exit-Code in seinem Statuslog. So kannst du auch
 ohne Logtext erkennen, welcher Fall vorlag.
@@ -217,8 +283,18 @@ ohne Logtext erkennen, welcher Fall vorlag.
    ("$TM_SHARE", "$TASK_ID"). Inbox-Skript war hier nachlaessig — wir machen es
    sauber.
 2. **Kein `function`-Keyword:** POSIX-Stil `name() { … }`.
-3. **`grep -F`-Anker:** Suchstring `/${TM_SHARE}/` (mit finalem Slash), damit
-   `TM_host_a_old` nicht aus Versehen mitzaehlt.
+3. **`grep -E`-Pattern (Heuristik "aktiv schreibend"):**
+   `/${TM_SHARE}[[:space:]]+[^[:space:]]*/(bands|mapped)/`. Nicht jeder Lock
+   bedeutet "in Benutzung" — macOS-TM haelt persistente Mount-Locks
+   (`lock`, `Info.plist`, `bands`-Directory) auch zwischen den Backup-Laeufen.
+   Diese sind unkritisch (Bundle ist konsistent). Aktive Writes erkennt man
+   an Subpfaden `bands/<hex>` bzw. `mapped/<hex>` — nur diese matchen wir.
+   Folge: Phase A wartet nur wenn TM **tatsaechlich gerade schreibt**, nicht
+   bei einfach nur gemountetem Bundle. Drei "darf-laufen"-Zustaende: Mac aus,
+   Mac schlafend (Bundle unmounted oder idle), Mac wach aber TM idle.
+   (Frueher zwei Iterationen: `$7 ~ "/" share "$"` war richtig aber fragil;
+   `/${TM_SHARE}/` war komplett falsch (SharePath endet ohne Slash);
+   `/${TM_SHARE}[[:space:]]` war zu strikt (jeder Lock zaehlte).)
 4. **Polling-Granularitaet:** in der HB-Wartephase pollen wir im selben Takt
    wie in der SMB-Wartephase (30 s). Schont CPU.
 5. **Race in Schritt 6–9:** falls Mac in den ~1 s zwischen "share zu" und
@@ -305,8 +381,12 @@ ohne Logtext erkennen, welcher Fall vorlag.
       ausfuehren" → Exit 0
 - [ ] Test 4 (Echter Lauf, Mac aus) — bewusst nicht automatisiert, weil
       tatsaechlicher Backup-Lauf (~2,5 h). Nutzer entscheidet wann.
-- [ ] Test 5 (SMB-Timeout, kuenstlich verkuerzt) — nur sinnvoll wenn TM-Mac
-      gerade aktiv schreibt. Optional.
+- [x] Test 5 (SMB-Timeout, kuenstlich verkuerzt) — bestaetigt: bei aktivem
+      TM-Mac polled Phase A 6x im 15s-Takt, nach 90s Exit 10 mit WARNUNG.
+      Hat zugleich den Bug im urspruenglichen is_share_open()-Filter
+      aufgedeckt (siehe heikle Details Punkt 3): SharePath und Name sind
+      in smbstatus -L getrennte Spalten, `/${TM_SHARE}/` mit finalem Slash
+      matcht nie. Fix auf `grep -E /${TM_SHARE}[[:space:]]`.
 - [ ] Test 6 (Logrotation-Robustheit, optional) — aufwendig zu inszenieren,
       Code-Pfad ist mit `check_logrotate()` aber dokumentiert und gepatcht.
 - [ ] Skript per Copy-Paste in DSM-Aufgabenplaner einsetzen (GUI-Arbeit;
