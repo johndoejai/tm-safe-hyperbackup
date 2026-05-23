@@ -1,3 +1,4 @@
 config.sh
 *.log
 .DS_Store
+inbox/

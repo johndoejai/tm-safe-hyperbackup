@@ -7,8 +7,14 @@
 # nicht zwingend) versucht, ein ruhiges Fenster ohne aktive TM-Schreibvorgaenge
 # zu finden.
 #
-# Einsatz: per Copy-Paste in einen DSM-Aufgabenplaner-Task. Pro TM-Freigabe
-# eine eigene Kopie mit angepassten Werten im Konfigurationsblock.
+# Voraussetzungen: DSM 7.x, Btrfs-Volume fuer die TM-Freigabe, HyperBackup-
+# Paket, ein bereits angelegter HB-Task pro TM-Freigabe. Externe Tools:
+# smbstatus (Samba 4.12+, --json), jq, synobackup, cksum, awk, sort, sed, stat.
+#
+# Einsatz: per Copy-Paste in einen DSM-Aufgabenplaner-Task (User: root). Pro
+# TM-Freigabe eine eigene Kopie mit angepassten Werten im Konfigurationsblock.
+#
+# Schnellstart und volle Doku siehe README.md.
 #
 # ----------------------------------------------------------------------------
 # Konsistenz-Garantie und Rolle der Wartephase
@@ -63,11 +69,14 @@ set -eu
 # aendern.
 
 # ====== Anpassen pro TM-Freigabe ======
-# Beispiel: TM_host_a  -> TASK_ID=4, TASK_NAME="SynoC2-TM_host_a"
-# Beispiel: TM_host_b -> TASK_ID=1, TASK_NAME="SynoC2-TM_host_b"
-TM_SHARE="${TM_SHARE:-TM_host_a}"                    # Name der TM-Freigabe (wie in DSM)
-TASK_ID="${TASK_ID:-4}"                            # HyperBackup-Task-ID
-TASK_NAME="${TASK_NAME:-SynoC2-TM_host_a}"           # HyperBackup-Task-Name (Log-Filter)
+# 1. TM_SHARE: Name der TM-Freigabe wie in DSM angelegt (Systemsteuerung ->
+#    Freigegebener Ordner). Beispiele: "TimeMachine", "TM_MacBook", "TM_kids".
+# 2. TASK_ID + TASK_NAME: aus /var/packages/HyperBackup/etc/synobackup.conf
+#    auslesen. Im [task_N]-Block, dessen "backup_folders" deine TM-Freigabe
+#    enthaelt, ist N die TASK_ID und der Wert von name="..." der TASK_NAME.
+TM_SHARE="${TM_SHARE:-TimeMachine}"                # Name der TM-Freigabe (wie in DSM)
+TASK_ID="${TASK_ID:-1}"                            # HyperBackup-Task-ID
+TASK_NAME="${TASK_NAME:-MyHyperBackupTask}"        # HyperBackup-Task-Name (Log-Filter)
 DRY_RUN="${DRY_RUN:-0}"                            # 1 = nichts ausloesen, nur protokollieren
 DEBUG="${DEBUG:-0}"                                # 1 = rohe smbstatus-Auszuege ins Log (Diagnose)
 

@@ -26,8 +26,8 @@ KISS, wenig Abhaengigkeiten, wartungsarm.
   (`/volume2/TM_host_a`), nicht den Share-Namen. Filter daher
   `awk '$7 ~ "/" TM_SHARE "$" { ... }'`.
 
-### Lokales Beispielskript als Stil-Referenz (`inbox/2025_07_29_myapp_hyper_backup_w_update.sh`)
-Was wir daraus uebernehmen koennen:
+### Stil-Referenz aus existierenden Community-Skripten
+Was wir uebernehmen koennen (gangige Praxis in DSM-Aufgabenplaner-Skripten):
 - Skript wird im DSM-Aufgabenplaner inline geklebt, Output via `echo`.
 - Header mit Changelog-Block.
 - `set -eu` / `set -euo pipefail` als scharfer Modus oben (wir bewerten unten,
@@ -170,14 +170,14 @@ nicht nur den TM-Client.
   im offiziellen CLI Guide **nicht** in dieser Semantik dokumentiert.
 - Task-ID-Quelle: `/usr/syno/etc/synobackup.conf` (oft Symlink/Spiegel von
   `/var/packages/HyperBackup/etc/synobackup.conf`).
-- Log-Quelle: `/var/log/synolog/synobackup.log`. (In `inbox/`-Skript stand
-  `/var/packages/HyperBackup/var/log/synolog/synobackup.log` — beides kursiert;
+- Log-Quelle: `/var/log/synolog/synobackup.log`. (In Community-Skripten steht
+  auch `/var/packages/HyperBackup/var/log/synolog/synobackup.log` — beides kursiert;
   vor dem Loslegen pruefen wir, welcher Pfad bei dir Daten enthaelt.)
 - **Wichtig:** `synobackup --backup` kehrt **sofort** zurueck, der eigentliche
   Backup-Lauf erfolgt im Hintergrund. Es gibt **keinen verlaesslichen Exit-Code**
   fuer Erfolg/Fehler.
 - Fortschritt erkennen via:
-  - Log-Tail (so macht es das `inbox/`-Skript), oder
+  - Log-Tail (gaengig in Community-Skripten), oder
   - Prozesspolling: `pidof -s -x /var/packages/HyperBackup/target/bin/img_backup`.
 - Ein offizielles `--is-running` oder Aehnliches: **unklar**, kein Beleg gefunden.
 
@@ -344,7 +344,7 @@ Anmerkungen: Es gibt schon einen Task. ID können wir später besorgen. Es gibt 
 6. **Log-Pfad pruefen:** `/var/log/synolog/synobackup.log` vs.
    `/var/packages/HyperBackup/var/log/synolog/synobackup.log` — welcher hat
    bei dir aktuellen Inhalt?
-Anmerkung: Nimm das aus meinem Skript aus der inbox. Das funktioniert bisher.
+Anmerkung: `/var/packages/HyperBackup/var/log/synolog/synobackup.log` funktioniert in der Praxis.
 
 7. **Trockenlauf:** in Phase eins (vor Implementierung der "scharfen" Aktion)
    wollen wir das Skript wahrscheinlich erst im **Dry-Run-Modus** testen —
@@ -360,7 +360,7 @@ Anmerkung: Nimm das aus meinem Skript aus der inbox. Das funktioniert bisher.
 - Task-ID: pro Skript inline als Variable; konkrete Werte besorgen wir spaeter
   per `synobackup --list` bzw. aus `/usr/syno/etc/synobackup.conf`.
 - Log-Pfad: `/var/packages/HyperBackup/var/log/synolog/synobackup.log` (laut
-  Nutzer-Anmerkung; funktioniert im inbox-Skript bereits).
+  Nutzer-Anmerkung; in Community-Skripten gaengiger Pfad).
 - DRY_RUN-Schalter als Variable oben im Skript.
 
 ## Nachtrag 3 (21. Mai 2026): Stuck-Lease-Befund kippt die Strategie

@@ -26,9 +26,9 @@ eigene Kopie mit angepassten Werten.
 ## Skript-Aufbau
 
 ### 1. Kopfblock
-- Shebang: `#!/bin/sh` (DSM-Aufgabenplaner-konform; entspricht inbox-Skript).
-- Header-Kommentar mit Beschreibung, Autor, **Changelog-Block** (Format wie im
-  inbox-Skript: Datum + Aenderung).
+- Shebang: `#!/bin/sh` (DSM-Aufgabenplaner-konform).
+- Header-Kommentar mit Beschreibung, Autor, **Changelog-Block** (Format:
+  Datum + Aenderung).
 - Hinweis im Header, dass pro TM-Freigabe eine eigene Kopie genommen wird, und
   die markierten Variablen unten anzupassen sind.
 
